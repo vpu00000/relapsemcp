@@ -4,7 +4,7 @@ export const NO_CLIENT_ERROR: ToolTextResponse = {
   content: [
     {
       type: "text",
-      text: "No Roblox client connected to the MCP server. Please notify the user that they have to run the connector.luau script in order to connect the MCP server to their game.",
+      text: "Relapse has no ready Roblox session or its MCP channel is still connecting. Start the game and retry shortly.",
     },
   ],
   isError: true,
@@ -14,7 +14,7 @@ export const INVALID_CLIENT_ERROR: ToolTextResponse = {
   content: [
     {
       type: "text",
-      text: "Invalid client ID provided. Please use the list-clients tool to get a list of valid client IDs.",
+      text: "Invalid, inactive, or ambiguous client ID. Use list-clients for current IDs, then pass clientId or set-active-client to select a session.",
     },
   ],
   isError: true,

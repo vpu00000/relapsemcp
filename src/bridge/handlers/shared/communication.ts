@@ -1,167 +1,83 @@
-import crypto from "crypto";
-import { WebSocket } from "ws";
-import { TOOL_RESPONSE_TIMEOUT } from "../../../config.js";
-import type {
-  DispatchResult,
-  InstanceRole,
-  RobloxClient,
-  RobloxResponse,
-  ResponseResolver,
-} from "../../types.js";
+import crypto from "node:crypto";
+import { runtime, type RelapseClientInfo } from "../../../relapse/runtime.js";
+import { upsertScriptSources, clearScriptSourceIndex } from "./script-source-store.js";
+import type { RobloxResponse, DispatchResult, ResponseResolver } from "../../types.js";
 import { getActiveClientId, resolveTargetClient } from "./registry.js";
 
-const MAX_PENDING_HTTP_COMMANDS = 100;
+const resolvers = new Map<string, { clientId: string; resolve: ResponseResolver }>();
 
-// ─── Instance role ────────────────────────────────────────────────────────────
-let instanceRole: InstanceRole = "primary";
-
-export function getInstanceRole(): InstanceRole {
-  return instanceRole;
-}
-
-export function setInstanceRole(role: InstanceRole): void {
-  instanceRole = role;
-}
-
-// ─── Primary-mode routing state ───────────────────────────────────────────────
-export const httpResponseResolvers: Map<string, ResponseResolver> = new Map();
-export const requestToClientId: Map<string, string> = new Map();
-
-export const relayClients: Set<WebSocket> = new Set();
-export const relayRequestOrigin: Map<string, WebSocket> = new Map();
-
-// ─── Secondary-mode routing state ─────────────────────────────────────────────
-let relaySocket: WebSocket | null = null;
-export const secondaryResponseResolvers: Map<string, ResponseResolver> = new Map();
-
-export function getRelaySocket(): WebSocket | null {
-  return relaySocket;
-}
-
-export function setRelaySocket(ws: WebSocket | null): void {
-  relaySocket = ws;
-}
-
-export function resetPrimaryState(): void {
-  httpResponseResolvers.clear();
-  requestToClientId.clear();
-  relayClients.clear();
-  relayRequestOrigin.clear();
-}
-
-export function resetSecondaryState(): void {
-  secondaryResponseResolvers.clear();
-}
-
-// ─── Low-level send ───────────────────────────────────────────────────────────
-export function SendToClient(target: RobloxClient, message: string): void {
-  if (target.transport === "ws" && target.ws && target.ws.readyState === WebSocket.OPEN) {
-    target.ws.send(message);
-  } else if (target.transport === "http") {
-    if (target.pendingHttpCommands.length >= MAX_PENDING_HTTP_COMMANDS) {
-      target.pendingHttpCommands.shift();
-    }
-    target.pendingHttpCommands.push(message);
-
-    const waiter = target.pendingPollResolve;
-    if (waiter) {
-      target.pendingPollResolve = null;
-      const batch = target.pendingHttpCommands;
-      target.pendingHttpCommands = [];
-      waiter(batch);
+runtime.on("client", (client: { clientId: string } | null, previous: { clientId: string } | null) => {
+  if (previous && previous.clientId !== client?.clientId) {
+    clearScriptSourceIndex(previous.clientId);
+    for (const [id, pending] of resolvers) {
+      if (pending.clientId !== previous.clientId) continue;
+      resolvers.delete(id);
+      pending.resolve({ id, error: "Relapse MCP channel disconnected while the request was running." });
     }
   }
-}
-
-// ─── Response waiter ──────────────────────────────────────────────────────────
-export function GetResponseOfIdFromClient(
-  id: string,
-  timeoutMs: number = TOOL_RESPONSE_TIMEOUT
-): Promise<RobloxResponse> {
-  return new Promise((resolve) => {
-    let settled = false;
-    let timeout: NodeJS.Timeout;
-
-    const resolveOnce: ResponseResolver = (data) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      resolve(data);
-    };
-
-    timeout = setTimeout(() => {
-      if (instanceRole === "secondary") {
-        secondaryResponseResolvers.delete(id);
-      } else {
-        httpResponseResolvers.delete(id);
-      }
-
-      resolveOnce({
-        id,
-        output: undefined,
-        error: `Timed out waiting for response after ${timeoutMs}ms.`,
+});
+runtime.on("message", (message: Record<string, unknown>, client: RelapseClientInfo) => {
+  if (message.type === "script-sources") {
+    try {
+      upsertScriptSources({ clientId: client.clientId, placeId: client.placeId, jobId: client.jobId }, {
+        scripts: Array.isArray(message.scripts) ? message.scripts as [] : [],
+        removedScriptIds: message.removedScriptIds,
+        hasFinishedMapping: message.hasFinishedMapping === true,
+        sourcesToMap: Number(message.sourcesToMap ?? 0),
+        processedSources: Number(message.processedSources ?? 0),
+        skippedSources: Number(message.skippedSources ?? 0),
+        mappingSessionId: message.mappingSessionId,
+        mappingSessionStartedAt: message.mappingSessionStartedAt,
+        mappingRevision: message.mappingRevision,
+        beginMappingSession: message.beginMappingSession,
       });
-    }, timeoutMs);
-
-    if (instanceRole === "secondary") {
-      secondaryResponseResolvers.set(id, resolveOnce);
-      return;
+    } catch (error) {
+      console.error("[Relapse] Failed to index script sources:", error);
     }
-    httpResponseResolvers.set(id, resolveOnce);
+    return;
+  }
+  if (typeof message.id !== "string") return;
+  const pending = resolvers.get(message.id);
+  if (!pending || pending.clientId !== client.clientId) return;
+  resolvers.delete(message.id);
+  pending.resolve(message as RobloxResponse);
+});
+
+export function SendArbitraryDataToClient(
+  type: string, data: Record<string, unknown>, id?: string, clientId = getActiveClientId()
+): Promise<DispatchResult> {
+  const target = resolveTargetClient(clientId);
+  if (!target) return Promise.resolve(clientId ? "INVALID_CLIENT" : null);
+  const requestId = id ?? crypto.randomUUID();
+  return runtime.send(type, data, requestId, target.clientId).then(() => requestId).catch((error) => {
+    console.error("[Relapse] Could not send command:", error);
+    return null;
   });
 }
 
-// ─── High-level dispatch ──────────────────────────────────────────────────────
-export function SendArbitraryDataToClient(
-  type: string,
-  data: Record<string, unknown>,
-  id?: string,
-  clientId: string | undefined = getActiveClientId()
-): DispatchResult {
-  if (instanceRole === "secondary") {
-    if (!relaySocket || relaySocket.readyState !== WebSocket.OPEN) return null;
-    const requestId = id ?? crypto.randomUUID();
-    const message = {
-      id: requestId,
-      ...data,
-      type,
-      ...(clientId ? { targetClientId: clientId } : {}),
-    };
-    relaySocket.send(JSON.stringify(message));
-    return requestId;
-  }
-
+export async function SendAndWaitForResponse(
+  type: string, data: Record<string, unknown>, timeoutMs = 15_000,
+  clientId = getActiveClientId()
+): Promise<{ callId: DispatchResult; response?: RobloxResponse }> {
   const target = resolveTargetClient(clientId);
-  if (!target) return clientId !== undefined ? "INVALID_CLIENT" : null;
-
-  const requestId = id ?? crypto.randomUUID();
-  const message = { id: requestId, ...data, type };
-
-  requestToClientId.set(requestId, target.clientId);
-  SendToClient(target, JSON.stringify(message));
-
-  return requestId;
-}
-
-// ─── Route a response from a Roblox client ────────────────────────────────────
-export function handleRobloxResponse(data: RobloxResponse): void {
-  if (!data.id) return;
-
-  // If the request originated from a relayed secondary, forward it back.
-  const originRelay = relayRequestOrigin.get(data.id);
-  if (originRelay && originRelay.readyState === WebSocket.OPEN) {
-    originRelay.send(JSON.stringify(data));
-    relayRequestOrigin.delete(data.id);
-    requestToClientId.delete(data.id);
-    return;
+  if (!target) return { callId: clientId ? "INVALID_CLIENT" : null };
+  const id = crypto.randomUUID();
+  // Register before writing: a fast peer can reply before Channel.send resolves.
+  const response = new Promise<RobloxResponse>((resolve) => {
+    const timeout = setTimeout(() => {
+      resolvers.delete(id);
+      resolve({ id, error: `Timed out waiting for response after ${timeoutMs}ms.` });
+    }, timeoutMs);
+    resolvers.set(id, { clientId: target.clientId, resolve: (response) => { clearTimeout(timeout); resolve(response); } });
+  });
+  try {
+    await runtime.send(type, data, id, target.clientId);
+  } catch (error) {
+    console.error("[Relapse] Could not send command:", error);
+    const pending = resolvers.get(id);
+    resolvers.delete(id);
+    pending?.resolve({ id, error: "Relapse MCP channel disconnected while sending the request." });
+    return { callId: null };
   }
-  relayRequestOrigin.delete(data.id);
-
-  // Otherwise it's a local primary request.
-  const resolver = httpResponseResolvers.get(data.id);
-  if (resolver) {
-    resolver(data);
-    httpResponseResolvers.delete(data.id);
-  }
-  requestToClientId.delete(data.id);
+  return { callId: id, response: await response };
 }

@@ -1,8 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerClientTool } from "../../client-routing.js";
 import { z } from "zod";
-import { clientStampPrefix, sendAndWait, toolTextResponse } from "../../factory.js";
-import { isSecondaryRelay, relayToolToApi } from "../../factory.js";
+import { clientStampPrefix, describeResponse, sendAndWait, toolTextResponse } from "../../factory.js";
 import { maxOutputCharsSchema } from "../../schemas.js";
 import { fetchScriptSearchIndex, type ScriptSearchDocument } from "./script-sources.js";
 
@@ -60,7 +59,7 @@ export default function register(server: McpServer): void {
     {
       title: "Get the content of a script in the Roblox Game Client",
       description:
-        "Get decompiled source for a Roblox script by path, script proxy, or getter code. Use startLine/endLine for a focused range when the full script is large.",
+        "Get decompiled source for a Roblox script by path, script proxy, or getter code. Explicit requests can decompile scripts above the automatic indexing size limits. Use startLine/endLine for a focused range when the full script is large; decompilation still processes the whole script.",
       inputSchema: z.object({
         scriptGetterSource: z
           .string()
@@ -95,21 +94,6 @@ export default function register(server: McpServer): void {
       }),
     },
     async ({ scriptGetterSource, scriptPath, startLine, endLine, maxLines, maxOutputChars }) => {
-      // Secondary mode: relay to primary which has the script source index.
-      if (isSecondaryRelay()) {
-        return relayToolToApi("get-script-content", {
-          ...(scriptGetterSource !== undefined ? { scriptGetterSource } : {}),
-          ...(scriptPath !== undefined ? { scriptPath } : {}),
-          ...(startLine !== undefined ? { startLine } : {}),
-          ...(endLine !== undefined ? { endLine } : {}),
-          maxLines,
-          maxOutputChars,
-        }, 60000, {
-          maxOutputChars,
-          truncationHint: "Rerun get-script-content with startLine/endLine or a smaller maxLines value.",
-        });
-      }
-
       if (scriptGetterSource === undefined && scriptPath === undefined) {
         return toolTextResponse("Must provide either scriptGetterSource or scriptPath.", {}, true);
       } else if (scriptGetterSource !== undefined && scriptPath !== undefined) {
@@ -137,8 +121,6 @@ export default function register(server: McpServer): void {
               }
             );
           }
-        } else if (scriptProxyMatch) {
-          return indexResult.response;
         }
       }
 
@@ -158,7 +140,7 @@ export default function register(server: McpServer): void {
         maxOutputChars,
         stampClient: true,
         truncationHint: "Rerun get-script-content with startLine/endLine or a smaller maxLines value.",
-        failureMessage: () => "Failed to get script content.",
+        failureMessage: (response) => "Failed to get script content: " + describeResponse(response),
       });
     }
   );

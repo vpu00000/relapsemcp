@@ -1,81 +1,48 @@
 return function(context, Bridge)
-local ScriptMappingPipeline = context.ScriptMappingPipeline
-local GetScriptByDebugId = context.GetScriptByDebugId
-local DecompileScriptSource = context.DecompileScriptSource
-local QueueMappedScriptSource = context.QueueMappedScriptSource
-
     Bridge:BindToTypeRaw("get-script-content", function(data)
-        local source
         local scriptInstance
-
-        --// Handle GC'd script proxies: debugId is passed directly, skip loadstring \\--
         if data.debugId then
-            scriptInstance = GetScriptByDebugId(data.debugId)
-            assert(scriptInstance, "No live script instance found for ScriptProxy with DebugId: " .. tostring(data.debugId))
+            scriptInstance = context.GetScriptByDebugId(data.debugId)
+            assert(scriptInstance, "No live script instance found for DebugId: " .. tostring(data.debugId))
         else
             setthreadidentity(8)
             scriptInstance = loadstring(data.source)()
-
             assert(typeof(scriptInstance) == "Instance", "Script instance is not an instance.")
-            assert(scriptInstance:IsA("LuaSourceContainer"), "Script instance is not a LuaSourceContainer (Script, LocalScript, or ModuleScript).")
-            assert(not (
-                scriptInstance.ClassName == "Script" and
-                scriptInstance.RunContext ~= Enum.RunContext.Client
-            ), "Script instance is a server-only Script.")
+            assert(scriptInstance:IsA("LuaSourceContainer"), "Script instance is not a LuaSourceContainer.")
+            assert(not (scriptInstance:IsA("Script") and scriptInstance.RunContext ~= Enum.RunContext.Client),
+                "Script instance is server-only.")
         end
-
-        local scriptHash
-        source, _, scriptHash = DecompileScriptSource(
-            scriptInstance,
-            nil,
-            ScriptMappingPipeline.generation,
-            ScriptMappingPipeline.clientId
-        )
-        assert(source, "Failed to decompile script.")
-
-        local debugId = scriptInstance:GetDebugId()
-        local mappingJob = ScriptMappingPipeline.jobs[debugId]
-        if ScriptMappingPipeline.clientId and (not mappingJob or mappingJob.state ~= "mapped") then
-            QueueMappedScriptSource(
-                scriptInstance,
-                source,
-                scriptHash,
-                ScriptMappingPipeline.generation,
-                debugId
-            )
+        local source, failure = context.DecompileScriptSource(scriptInstance)
+        assert(source, failure or "Failed to decompile script.")
+        -- Count and slice directly: an on-demand decompilation may be much
+        -- larger than the automatic cache, so don't allocate a table per line.
+        local total, cursor = 1, 1
+        while true do
+            local newline = string.find(source, "\n", cursor, true)
+            if not newline then break end
+            total += 1
+            cursor = newline + 1
         end
-
-        --// Line range support with bounded default preview \\--
-        local lines = {}
-        local pos = 1
-        local len = #source
-        while pos <= len do
-            local newlinePos = source:find("\n", pos, true)
-            if newlinePos then
-                table.insert(lines, source:sub(pos, newlinePos - 1))
-                pos = newlinePos + 1
-            else
-                table.insert(lines, source:sub(pos))
-                break
-            end
+        local maxLines = math.max(1, math.min(tonumber(data.maxLines) or 80, 2000))
+        local startLine = math.max(1, math.min(tonumber(data.startLine) or 1, total))
+        local requestedEnd = math.max(startLine, math.min(tonumber(data.endLine) or total, total))
+        local endLine = math.min(requestedEnd, startLine + maxLines - 1)
+        cursor = 1
+        for _ = 1, startLine - 1 do cursor = string.find(source, "\n", cursor, true) + 1 end
+        local first, last = cursor, #source
+        for line = startLine, endLine do
+            local newline = string.find(source, "\n", cursor, true)
+            if line == endLine then last = if newline then newline - 1 else #source end
+            if newline then cursor = newline + 1 end
         end
-
-        local totalLines = #lines
-        local maxLines = math.max(1, math.min(tonumber(data.maxLines) or 200, 2000))
-        local startLine = data.startLine and math.max(1, math.min(data.startLine, totalLines)) or 1
-        local requestedEndLine = data.endLine and math.max(startLine, math.min(data.endLine, totalLines)) or totalLines
-        local endLine = math.min(requestedEndLine, startLine + maxLines - 1)
-
-        local sliced = {}
-        for i = startLine, endLine do
-            table.insert(sliced, lines[i])
-        end
-
-        local footer = ""
-        if endLine < requestedEndLine then
-            footer = "\n-- Output truncated to " .. maxLines .. " lines. Rerun with startLine=" .. (endLine + 1) .. " or a tighter range to continue."
-        end
-
-        return "-- Lines " .. startLine .. "-" .. endLine .. " of " .. totalLines .. "\n" .. table.concat(sliced, "\n") .. footer
+        -- Leave room for JSON escaping within the 8 MiB channel frame.
+        local maxRangeBytes = 1024 * 1024
+        local byteLimitHit = last - first + 1 > maxRangeBytes
+        local footer = if endLine < requestedEnd then
+            "\n-- Output truncated to " .. maxLines .. " lines. Rerun with startLine=" .. (endLine + 1) .. "."
+            else ""
+        if byteLimitHit then footer = "\n-- Output truncated to 1 MiB. Request a smaller line range." end
+        return "-- Lines " .. startLine .. "-" .. endLine .. " of " .. total .. "\n" ..
+            string.sub(source, first, math.min(last, first + maxRangeBytes - 1)) .. footer
     end)
 end
